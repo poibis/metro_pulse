@@ -202,6 +202,21 @@ class MetroDataLoader:
         """LightGBM 학습을 위한 시나리오 증강 데이터셋 생성."""
         self.load_data()
 
+        # CSV 컬럼 불일치 등으로 station_baselines가 비어 있을 경우 기본 샘플 데이터 생성
+        if not self.station_baselines:
+            print(">> [Warning] CSV에서 승하차 기준 데이터를 찾지 못해 기본 역 데이터셋을 생성합니다.")
+            base_curve = {
+                label: (6500.0 if "08-09" in label else 9500.0 if "18-19" in label else 2400.0)
+                for _, label in STANDARD_TIME_SLOTS
+            }
+            for st in MAJOR_STATIONS:
+                self.station_baselines[f"2호선_{st}"] = base_curve.copy()
+                if "2호선" not in self.stations_by_line:
+                    self.stations_by_line["2호선"] = []
+                if st not in self.stations_by_line["2호선"]:
+                    self.stations_by_line["2호선"].append(st)
+            self.lines = sorted(list(self.stations_by_line.keys()))
+
         rows = []
         scenario_types = [
             (0, "weekday", 1.0),
@@ -252,3 +267,4 @@ class MetroDataLoader:
                         })
 
         return pd.DataFrame(rows)
+

@@ -95,8 +95,8 @@ class LightGBMTrainer:
                 self.feature_importance_pct = data.get("feature_importance_pct", {})
                 self.metrics = data.get("metrics", {})
                 return self.model, self.feature_importance_pct
-            except Exception:
-                pass
+            except Exception as e:
+                print(f">> [Warning] 기존 모델 아티팩트 로드 실패 ({e}), 재학습을 진행합니다.")
 
         res = self.train()
         return res["model"], res["feature_importance_pct"]
