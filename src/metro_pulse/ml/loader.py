@@ -1,8 +1,7 @@
-"""Data loading and preprocessing module for Metro Pulse."""
-
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import re
+import zlib
 import numpy as np
 import pandas as pd
 
@@ -42,6 +41,11 @@ def clean_station_name(name: str) -> str:
     return re.sub(r"\(.*?\)", "", str(name)).strip()
 
 
+def stable_station_id(station: str) -> int:
+    """프로세스 재시작/OS 환경과 무관하게 항상 동일한 0~999 정수 ID 반환."""
+    return zlib.crc32(station.encode("utf-8")) % 1000
+
+
 def parse_travel_sec(time_str: str) -> int:
     """MM:SS 형식을 초(sec)로 변환."""
     try:
@@ -53,12 +57,22 @@ def parse_travel_sec(time_str: str) -> int:
         return 90
 
 
+def read_csv_safe(path: Path) -> pd.DataFrame:
+    """한글 공공데이터 CSV 인코딩 자동 감지 로드."""
+    for enc in ("cp949", "utf-8-sig", "euc-kr", "utf-8"):
+        try:
+            return pd.read_csv(path, encoding=enc, low_memory=False)
+        except Exception:
+            continue
+    raise ValueError(f"CSV 파일을 읽을 수 없습니다: {path}")
+
+
 class MetroDataLoader:
     _instance: Optional["MetroDataLoader"] = None
 
     def __init__(self):
-        self.station_baselines: Dict[str, Dict[str, float]] = {}  # f"{line}_{station}": {time_label: avg_pax}
-        self.distance_map: Dict[str, Dict[str, Tuple[float, int]]] = {}  # f"{line}_{st}": (dist_km, sec)
+        self.station_baselines: Dict[str, Dict[str, float]] = {}
+        self.distance_map: Dict[str, Dict[str, Tuple[float, int]]] = {}
         self.lines: List[str] = []
         self.stations_by_line: Dict[str, List[str]] = {}
         self.loaded = False
@@ -77,6 +91,7 @@ class MetroDataLoader:
         self._load_distance_csv()
         self._load_hourly_csv()
         self._sort_stations()
+        print(f">> [MetroDataLoader] 로드 완료: {len(self.lines)}개 노선, {len(self.station_baselines)}개 역 기준 데이터")
         self.loaded = True
 
     def _sort_stations(self) -> None:
@@ -89,12 +104,11 @@ class MetroDataLoader:
     def _load_distance_csv(self) -> None:
         path = settings.distance_csv_path
         if not path.exists():
+            print(f">> [Warning] 역간거리 CSV 없음: {path}")
             return
 
-        try:
-            df = pd.read_csv(path, encoding="cp949")
-        except Exception:
-            df = pd.read_csv(path, encoding="utf-8")
+        df = read_csv_safe(path)
+        df.columns = [str(c).strip() for c in df.columns]
 
         for _, row in df.iterrows():
             line_raw = str(row["호선"]).strip()
@@ -121,21 +135,23 @@ class MetroDataLoader:
     def _load_hourly_csv(self) -> None:
         path = settings.hourly_csv_path
         if not path.exists():
-            return
+            raise FileNotFoundError(f"승하차 CSV 파일이 존재하지 않습니다: {path}")
 
-        try:
-            df = pd.read_csv(path, encoding="cp949")
-        except Exception:
-            df = pd.read_csv(path, encoding="utf-8")
+        df = read_csv_safe(path)
+        df.columns = [str(c).strip() for c in df.columns]
 
-        df_board = df[df["승하차구분"] == "승차"]
+        df_board = df[df["승하차구분"].astype(str).str.strip() == "승차"].copy()
         raw_cols = [src for src, _ in STANDARD_TIME_SLOTS if src in df_board.columns]
         target_labels = [dst for src, dst in STANDARD_TIME_SLOTS if src in df_board.columns]
+
+        for col in raw_cols:
+            df_board[col] = pd.to_numeric(df_board[col], errors="coerce").fillna(0.0)
 
         grouped = df_board.groupby(["호선", "역명"])[raw_cols].mean().round(1).reset_index()
 
         for _, row in grouped.iterrows():
-            line = str(row["호선"]).strip()
+            line_raw = str(row["호선"]).strip()
+            line = f"{line_raw}호선" if not line_raw.endswith("호선") else line_raw
             raw_station = str(row["역명"]).strip()
             station = clean_station_name(raw_station)
 
@@ -143,7 +159,6 @@ class MetroDataLoader:
             for raw_col, label in zip(raw_cols, target_labels):
                 hourly_dict[label] = float(row[raw_col])
 
-            # 원본 역명 및 정제된 역명 둘 다 저장
             self.station_baselines[f"{line}_{raw_station}"] = hourly_dict
             self.station_baselines[f"{line}_{station}"] = hourly_dict
 
@@ -157,27 +172,23 @@ class MetroDataLoader:
     def get_station_baseline(self, line: str, station: str) -> Dict[str, float]:
         """역사 기준 시간대별 일평균 승차 인원 반환 (정확 매칭 + 퍼지 매칭)."""
         clean_st = clean_station_name(station)
-        
-        # 1. 정확 매칭
+
         key = f"{line}_{clean_st}"
         if key in self.station_baselines:
             return self.station_baselines[key]
-            
+
         key_raw = f"{line}_{station}"
         if key_raw in self.station_baselines:
             return self.station_baselines[key_raw]
 
-        # 2. 호선 일치 부분 매칭
         for k, v in self.station_baselines.items():
             if k.startswith(f"{line}_") and (clean_st in k or k.endswith(clean_st)):
                 return v
 
-        # 3. 타 호선 동일 역명 매칭
         for k, v in self.station_baselines.items():
             if clean_st in k:
                 return v
 
-        # 기본 폴백: 출퇴근 피크 곡선
         return {
             label: 4500.0 if "08-09" in label or "18-19" in label else 1200.0
             for _, label in STANDARD_TIME_SLOTS
@@ -202,21 +213,6 @@ class MetroDataLoader:
         """LightGBM 학습을 위한 시나리오 증강 데이터셋 생성."""
         self.load_data()
 
-        # CSV 컬럼 불일치 등으로 station_baselines가 비어 있을 경우 기본 샘플 데이터 생성
-        if not self.station_baselines:
-            print(">> [Warning] CSV에서 승하차 기준 데이터를 찾지 못해 기본 역 데이터셋을 생성합니다.")
-            base_curve = {
-                label: (6500.0 if "08-09" in label else 9500.0 if "18-19" in label else 2400.0)
-                for _, label in STANDARD_TIME_SLOTS
-            }
-            for st in MAJOR_STATIONS:
-                self.station_baselines[f"2호선_{st}"] = base_curve.copy()
-                if "2호선" not in self.stations_by_line:
-                    self.stations_by_line["2호선"] = []
-                if st not in self.stations_by_line["2호선"]:
-                    self.stations_by_line["2호선"].append(st)
-            self.lines = sorted(list(self.stations_by_line.keys()))
-
         rows = []
         scenario_types = [
             (0, "weekday", 1.0),
@@ -228,12 +224,15 @@ class MetroDataLoader:
         line_code_map = {f"{i}호선": i for i in range(1, 10)}
         np.random.seed(42)
 
-        for key, hourly_dict in self.station_baselines.items():
+        # 중복 학습 방지를 위해 정제된 역 키만 정렬하여 순회
+        unique_keys = sorted(list(self.station_baselines.keys()))
+        for key in unique_keys:
+            hourly_dict = self.station_baselines[key]
             parts = key.split("_", 1)
             line = parts[0]
             station = parts[1]
             line_code = line_code_map.get(line, 2)
-            station_hash = abs(hash(station)) % 1000
+            station_hash = stable_station_id(station)
 
             for time_idx, (_, label) in enumerate(STANDARD_TIME_SLOTS):
                 base_pax = hourly_dict.get(label, 500.0)
@@ -243,12 +242,12 @@ class MetroDataLoader:
                         weather_coeff = 1.0
                         event_coeff = 1.0
 
-                        if sc_code == 2:  # rain
+                        if sc_code == 2:
                             weather_coeff = round(np.random.uniform(1.08, 1.25), 2)
-                        elif sc_code == 3:  # event
+                        elif sc_code == 3:
                             event_coeff = round(np.random.uniform(1.15, 1.50), 2)
                             weather_coeff = round(np.random.uniform(0.95, 1.10), 2)
-                        elif sc_code == 1:  # weekend
+                        elif sc_code == 1:
                             weather_coeff = round(np.random.uniform(0.95, 1.05), 2)
 
                         noise = np.random.normal(1.0, 0.03)
@@ -267,4 +266,3 @@ class MetroDataLoader:
                         })
 
         return pd.DataFrame(rows)
-
