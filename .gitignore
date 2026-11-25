@@ -1,6 +1,4 @@
-Dockerfile
 metro_pulse.md
-pyproject.toml
 uv.lock
 .venv
 .idea

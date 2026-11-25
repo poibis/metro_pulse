@@ -1,0 +1,39 @@
+services:
+  app:
+    build: .
+    container_name: metro-pulse-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"   # 로컬 테스트용 (운영 VPS에서는 방화벽으로 8000 차단 상태 유지)
+    volumes:
+      - ./data:/app/data:ro
+      - ./artifacts:/app/artifacts
+      - ./frontend:/app/frontend:ro
+    expose:
+      - "8000"
+    networks:
+      - metro_net
+
+  proxy:
+    image: caddy:2-alpine
+    container_name: metro-pulse-caddy
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+      - "8443:8443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    networks:
+      - metro_net
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  metro_net:
+    driver: bridge
