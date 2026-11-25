@@ -1,4 +1,4 @@
-https://:8443 {
+jswjake.top:8443 {
     tls internal
     encode zstd gzip
     reverse_proxy app:8000
