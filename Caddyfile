@@ -1,4 +1,14 @@
 jswjake.top:8443 {
+    tls internal
+    redir https://www.jswjake.top:8443{uri} permanent
+}
+
+www.jswjake.top:8443 {
+    tls internal
     encode zstd gzip
     reverse_proxy app:8000
 }
+#jswjake.top:8443 {
+#    encode zstd gzip
+#    reverse_proxy app:8000
+#}
